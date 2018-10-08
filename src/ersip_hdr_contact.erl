@@ -11,11 +11,15 @@
 -export([uri/1,
          expires/2,
          set_expires/2,
+         params/1,
+         set_param/3,
          make/1,
          parse/1,
+         parse_hdr/1,
          assemble/1
         ]).
--export_type([contact/0]).
+-export_type([contact/0,
+              contact_param/0]).
 
 %%%===================================================================
 %%% Types
@@ -60,6 +64,15 @@ set_expires(ExpiresVal, #contact{params = Params} = Contact) when is_integer(Exp
     NewParams = lists:keystore(expires, 1, Params, {expires, ExpiresVal}),
     Contact#contact{params = NewParams}.
 
+-spec params(contact()) -> [contact_param()].
+params(#contact{params = Params}) ->
+    Params.
+
+set_param(ParamName, Value, #contact{params = Params} = Contact)
+        when is_binary(ParamName), is_binary(Value) ->
+    NewParams = [{ParamName, Value} | Params],
+    Contact#contact{params = NewParams}.
+
 -spec make(binary()) -> contact().
 make(Bin) when is_binary(Bin) ->
     case ersip_hdr_contact:parse(Bin) of
@@ -71,18 +84,27 @@ make(Bin) when is_binary(Bin) ->
 
 -spec parse(binary()) -> parse_result().
 parse(Bin) ->
+    case parse_hdr(Bin) of
+        {ok, Contact, <<>>} ->
+            {ok, Contact};
+        {ok, _, _} ->
+            {error, {invalid_contact, Bin}};
+        {error, _} = Err ->
+            Err
+    end.
+
+-spec parse_hdr(binary()) -> ersip_parser_aux:parse_result(contact()).
+parse_hdr(Bin) ->
     Parsers = [fun ersip_nameaddr:parse/1,
                fun ersip_parser_aux:trim_lws/1,
                fun parse_contact_params/1
               ],
     case ersip_parser_aux:parse_all(Bin, Parsers) of
-        {ok, [{DisplayName, URI}, _, ParamsList], <<>>} ->
-            {ok,
-             #contact{display_name = DisplayName,
-                      uri          = URI,
-                      params       = ParamsList
-                     }
-            };
+        {ok, [{DisplayName, URI}, _, ParamsList], Rest} ->
+            Contact = #contact{display_name = DisplayName,
+                               uri          = URI,
+                               params       = ParamsList},
+            {ok, Contact, Rest};
         {error, Reason} ->
             {error, {invalid_contact, Reason}}
     end.
@@ -115,15 +137,13 @@ assemble(#contact{} = Contact) ->
 parse_contact_params(<<$;, Bin/binary>>) ->
     do_parse_contact_params(Bin);
 parse_contact_params(Bin) ->
-    do_parse_contact_params(Bin).
+    {ok, [], Bin}.
 
 -spec do_parse_contact_params(binary()) -> ersip_parser_aux:parse_result([contact_param()]).
 do_parse_contact_params(<<>>) ->
     {ok, [], <<>>};
 do_parse_contact_params(Bin) ->
-    ersip_parser_aux:parse_kvps(fun contact_params_validator/2,
-                                <<";">>,
-                                Bin).
+    ersip_parser_aux:parse_params(fun contact_params_validator/2, $;, Bin).
 
 -spec contact_params_validator(binary(), binary() | novalue) -> Result when
       Result :: {ok, {q, ersip_qvalue:qvalue()}}

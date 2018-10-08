@@ -10,6 +10,7 @@
 
 -export([make/1,
          make_by_uri/1,
+         tcp/0, tls/0, udp/0,
          is_datagram/1,
          is_tls/1,
          is_reliable/1,
@@ -31,6 +32,7 @@
 -type transport() :: known_transport()
                    | other_transport().
 -type known_transport() :: {transport, transport_atom()}.
+-type known_transport(X) :: {transport, X}.
 -type other_transport() :: {other_transport, binary()}.
 -type port_number() :: 0..65535 | {default_port, transport()}.
 
@@ -55,6 +57,19 @@ make_by_uri(URI) ->
         _ ->
             {transport, udp}
     end.
+
+
+-spec tcp() -> known_transport(tcp).
+tcp() ->
+    {transport, tcp}.
+
+-spec tls() -> known_transport(tls).
+tls() ->
+    {transport, tls}.
+
+-spec udp() -> known_transport(udp).
+udp() ->
+    {transport, udp}.
 
 -spec parse(binary() | transport_atom()) -> Result when
       Result      :: {ok, transport()}

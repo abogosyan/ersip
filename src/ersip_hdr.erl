@@ -14,13 +14,15 @@
          add_value/2,
          add_values/2,
          raw_values/1,
+         name/1,
          add_topmost/2,
          replace_topmost/2,
          take_topmost/1,
          serialize_rev_iolist/2,
          as_integer/1
         ]).
--export_type([header/0]).
+-export_type([header/0,
+              header_key/0]).
 
 %%%===================================================================
 %%% Types
@@ -34,7 +36,7 @@
 -type value() :: iolist() | binary().
 
 -type header() :: #header{}.
--type header_key() :: {hdr_key, binary()}.
+-type header_key() :: ersip_hdr_names:header_key().
 
 %%%===================================================================
 %%% API
@@ -46,7 +48,7 @@
 make_key(#header{key = Key}) ->
     Key;
 make_key(HeaderName) ->
-    {hdr_key, ersip_hdr_names:compact_form(HeaderName)}.
+    ersip_hdr_names:make_key(HeaderName).
 
 %% @doc Create new headers.
 -spec new(Name :: binary()) -> header().
@@ -55,6 +57,16 @@ new(Name) when is_binary(Name) ->
     #header{name = Name,
             key  = make_key(Name),
             multiple_values = may_have_multiple_values(Key)
+           };
+new(KnownHeader) when is_atom(KnownHeader)  ->
+    Key = ersip_hdr_names:make_key(KnownHeader),
+    #header{name = ersip_hdr_names:print_form(KnownHeader),
+            key  = Key,
+            multiple_values = may_have_multiple_values(Key)};
+new({hdr_key, _} = HdrKey)  ->
+    #header{name = ersip_hdr_names:print_form(HdrKey),
+            key  = HdrKey,
+            multiple_values = may_have_multiple_values(HdrKey)
            }.
 
 -spec is_empty(header()) -> boolean().
@@ -135,6 +147,10 @@ as_integer(#header{values = []}) ->
     {error, no_header};
 as_integer(#header{values = [_,_ |_]}) ->
     {error, multiple_values}.
+
+-spec name(header()) -> binary().
+name(#header{name = Name}) ->
+    Name.
 
 %%%===================================================================
 %%% Internal implementation
@@ -219,7 +235,7 @@ may_have_multiple_values({hdr_key, <<"cseq">>}) ->
 may_have_multiple_values({hdr_key, <<"v">>}) -> %% Via
     true;
 may_have_multiple_values({hdr_key, <<"m">>}) -> %% Contact
-    true;
+    false;
 may_have_multiple_values({hdr_key, <<"k">>}) -> %% Supported
     true;
 may_have_multiple_values({hdr_key, <<"unsupported">>}) ->

@@ -5,14 +5,47 @@
 %%
 %% SIP dialog support
 %%
+%% Initial requests:
+%%    UAC:
+%%      1. Call uac_new when response with code 101..299 is received on request
+%%      2. Call uac_update when another response is received on initial request
+%%
+%%    UAS:
+%%      1. Call uas_verify/1 to check that is well-formed
+%%      2. Pass for processing and get response
+%%      3. Call uas_new/2 to create server-side transaction
+%%      4. Call uas_pass_response/2 for each next response.
+%%
+%% In-dialog requests:
+%%    UAC:
+%%      1. Call uac_request to make request matching dialog to send
+%%      2. Call uac_trans_result when response on dialog request is received
+%%
+%%    UAS:
+%%      1. Call uas_dialog_id to get dialog identifier and find dialog state
+%%      2. Call uas_process to update dialog state related to received request.
+%%
+%% Request types:
+%%   1. Regular
+%%   2. Target refresher - request that can change remote target of the dialog
+%%      for INVITE method it is only INVITE itself.
+%%      for subscriptions it is SUBSCRIBE and NOTIFY methods
+%%
 
 -module(ersip_dialog).
 
 -export([id/1,
+         uas_verify/1,
          uas_new/2,
+         uas_pass_response/3,
          uac_new/2,
+         uac_update/2,
          uac_request/2,
-         uac_trans_result/3
+         uac_trans_result/3,
+         uas_dialog_id/1,
+         uas_process/3,
+         remote_seq/1,
+         is_secure/1
         ]).
 
 -export_type([dialog/0,
@@ -42,11 +75,15 @@
 -type dialog() :: #dialog{}.
 -type id()     :: #dialog_id{}.
 -type state() :: early | confirmed.
--type request_type() :: target_referesh
+-type request_type() :: target_refresh
                       | regular.
 
 -type cc_check_fun() :: fun((ersip_sipmsg:sipmsg(), ersip_sipmsg:sipmsg()) -> cc_check_result()).
 -type cc_check_result() :: ok | {error, term()}.
+-type uas_process_result() :: {ok, dialog()}
+                            | {reply, ersip_sipmsg:sipmsg()}.
+
+-type uas_result() :: {dialog(), ersip_sipmsg:sipmsg()}.
 
 %%%===================================================================
 %%% API
@@ -71,6 +108,28 @@ id(#dialog{callid = CallId, local_tag = LocalTag, remote_tag = RemoteTag}) ->
                callid     = ersip_hdr_callid:make_key(CallId)
               }.
 
+-spec uas_verify(ersip_sipmsg:sipmsg()) -> ok | {reply, ersip_sipmsg:sipmsg()}.
+uas_verify(ReqSipMsg) ->
+    case check_contact(ReqSipMsg) of
+        ok ->
+            case check_record_route(ReqSipMsg) of
+                ok ->
+                    ok;
+                {error, {bad_record_route, _}} ->
+                    Reply = ersip_reply:new(400, [{reason, <<"Invalid Record-Route">>}]),
+                    {reply, ersip_sipmsg:reply(Reply, ReqSipMsg)}
+            end;
+        {error, multiple_contact_forbidden} ->
+            Reply = ersip_reply:new(400, [{reason, <<"Invalid Too Many Contacts">>}]),
+            {reply, ersip_sipmsg:reply(Reply, ReqSipMsg)};
+        {error, invalid_star_contact} ->
+            Reply = ersip_reply:new(400, [{reason, <<"Star Contact Forbidden">>}]),
+            {reply, ersip_sipmsg:reply(Reply, ReqSipMsg)};
+        {error, contact_required} ->
+            Reply = ersip_reply:new(400, [{reason, <<"No Contact Specified">>}]),
+            {reply, ersip_sipmsg:reply(Reply, ReqSipMsg)}
+    end.
+
 %% @doc New dialog on UAS side.
 %%
 %% Function get request that used to create dialog and preliminary
@@ -78,7 +137,7 @@ id(#dialog{callid = CallId, local_tag = LocalTag, remote_tag = RemoteTag}) ->
 %% updated response is returned.
 %%
 %% Implements 12.1.1 UAS behavior
--spec uas_new(ersip_sipmsg:sipmsg(), ersip_sipmsg:sipmsg()) -> {dialog(), ersip_sipmsg:sipmsg()}.
+-spec uas_new(ersip_sipmsg:sipmsg(), ersip_sipmsg:sipmsg()) -> uas_result().
 uas_new(Request, Response) ->
     %% Check request/response pair can create dialog.
     case uas_can_create_dialog(Request, Response) of
@@ -90,6 +149,20 @@ uas_new(Request, Response) ->
     OutResponse = uas_update_response(Request, Response),
     Dialog = uas_create(Request, Response),
     {Dialog, OutResponse}.
+
+-spec uas_pass_response(ersip_sipmsg:sipmsg(), ersip_sipmsg:sipmsg(), dialog()) -> uas_result().
+uas_pass_response(ReqSipMsg, RespSipMsg, #dialog{state = confirmed} = Dialog) ->
+    UpdatedResp = uas_update_response(ReqSipMsg, RespSipMsg),
+    {Dialog, UpdatedResp};
+uas_pass_response(ReqSipMsg, RespSipMsg, #dialog{state = early} = Dialog) ->
+    State = state_by_response(RespSipMsg),
+    UpdatedResp = uas_update_response(ReqSipMsg, RespSipMsg),
+    case State of
+        early ->
+            {Dialog, UpdatedResp};
+        confirmed ->
+            {Dialog#dialog{state = confirmed}, UpdatedResp}
+    end.
 
 %% @doc New dialog on UAC side.
 %%
@@ -103,6 +176,10 @@ uac_new(Req, Response) ->
             Dialog = uac_create(Req, Response),
             {ok, Dialog}
     end.
+
+-spec uac_update(ersip_sipmsg:sipmsg(), dialog()) -> {ok, dialog()} | terminate_dialog.
+uac_update(Response, #dialog{} = Dialog) ->
+    uac_trans_result(Response, target_refresh, Dialog).
 
 %% 12.2.1 UAC Behavior
 %% 12.2.1.1 Generating the Request
@@ -127,27 +204,14 @@ uac_request(Req0, #dialog{} = Dialog0) ->
     Req2  = ersip_sipmsg:set(from, From, Req1),
     %% The Call-ID of the request MUST be set to the Call-ID of the dialog.
     Req3  = ersip_sipmsg:set(callid, Dialog0#dialog.callid, Req2),
-    %% if the local sequence number is not empty, the value of the
-    %% local sequence number MUST be incremented by one, and this
-    %% value MUST be placed into the CSeq header field.
-    CSeq0  = get_or_create(cseq, Req0),
-    CSeqNum = ersip_hdr_cseq:number(CSeq0),
-    CSeq  = case Dialog0#dialog.local_seq of
-                empty ->
-                    CSeq0;
-                N when N >= CSeqNum ->
-                    ersip_hdr_cseq:set_number(N+1, CSeq0);
-                _ ->
-                    CSeq0
-            end,
-    Req4 = ersip_sipmsg:set(cseq, CSeq, Req3),
+    Req4 = maybe_update_cseq(Req0, Dialog0, Req3),
+    CSeq = ersip_sipmsg:get(cseq, Req4),
     Dialog1 = Dialog0#dialog{local_seq = ersip_hdr_cseq:number(CSeq)},
     %% The UAC uses the remote target and route set to build the
     %% Request-URI and Route header field of the request.
     #dialog{remote_target = RemoteTarget, route_set = RouteSet} = Dialog1,
     Req5 = fill_request_route(RemoteTarget, RouteSet, Req4),
-    Req6 = ersip_sipmsg:set(route, RouteSet, Req5),
-    {Dialog1, Req6}.
+    {Dialog1, Req5}.
 
 %% 12.2.1 UAC Behavior
 %% 12.2.1.2 Processing the Responses
@@ -163,19 +227,20 @@ uac_trans_result(timeout, _, #dialog{}) ->
     terminate_dialog;
 uac_trans_result(Resp, ReqType, #dialog{} = Dialog) ->
     case ersip_sipmsg:status(Resp) of
-        Code when Code >= 200 andalso Code =< 299 andalso ReqType == target_referesh ->
+        Code when Code >= 200 andalso Code =< 299 andalso ReqType == target_refresh ->
             %% When a UAC receives a 2xx response to a target refresh
             %% request, it MUST replace the dialog's remote target URI
             %% with the URI from the Contact header field in that
             %% response, if present.
-            case ersip_sipmsg:get(contact, Resp) of
+            Dialog1 = Dialog#dialog{state = confirmed},
+            case ersip_sipmsg:find(contact, Resp) of
                 not_found ->
-                    {ok, Dialog};
+                    {ok, Dialog1};
                 {ok, [Contact]} ->
-                    {ok, Dialog#dialog{remote_target = ersip_hdr_contact:uri(Contact)}};
+                    {ok, Dialog1#dialog{remote_target = ersip_hdr_contact:uri(Contact)}};
                 _ ->
                     %% In all other cases contact is invalid and we ignore it
-                    {ok, Dialog}
+                    {ok, Dialog1}
             end;
         481 ->
             %% If the response for a request within a dialog is a 481
@@ -190,8 +255,70 @@ uac_trans_result(Resp, ReqType, #dialog{} = Dialog) ->
 
 
 %% 12.2.2 UAS Behavior
+-spec uas_dialog_id(ersip_sipmsg:sipmsg()) -> {ok, id()} | no_dialog.
+uas_dialog_id(RequestSipMsg) ->
+    %% If the request has a tag in the To header field, the UAS core
+    %% computes the dialog identifier corresponding to the request and
+    %% compares it with existing dialogs.  If there is a match, this
+    %% is a mid-dialog request.
+    To     = ersip_sipmsg:get(to, RequestSipMsg),
+    From   = ersip_sipmsg:get(from, RequestSipMsg),
+    CallID = ersip_sipmsg:get(callid, RequestSipMsg),
+    case ersip_hdr_fromto:tag_key(To) of
+        undefined ->
+            no_dialog;
+        LocalTag ->
+            RemoteTag = ersip_hdr_fromto:tag_key(From),
+            {ok, #dialog_id{callid = CallID,
+                            local_tag = LocalTag,
+                            remote_tag = RemoteTag}}
+    end.
 
+-spec uas_process(ersip_sipmsg:sipmsg(), request_type(), dialog()) -> uas_process_result().
+uas_process(RequestSipMsg, ReqType, #dialog{remote_seq = empty} = Dialog0) ->
+    %% If the remote sequence number is empty, it MUST be set to the value
+    %% of the sequence number in the CSeq header field value in the request.
+    RemoteCSeq = ersip_sipmsg:get(cseq, RequestSipMsg),
+    RemoteCSeqNum = ersip_hdr_cseq:number(RemoteCSeq),
+    Dialog1 = Dialog0#dialog{remote_seq = RemoteCSeqNum},
+    uas_maybe_update_target(RequestSipMsg, ReqType, Dialog1);
+uas_process(RequestSipMsg, ReqType,  #dialog{remote_seq = StoredRCSeq} = Dialog0) ->
+    %% If the remote sequence number was not empty, but the sequence number
+    %% of the request is lower than the remote sequence number, the request
+    %% is out of order and MUST be rejected with a 500 (Server Internal
+    %% Error) response.  If the remote sequence number was not empty, and
+    %% the sequence number of the request is greater than the remote
+    %% sequence number, the request is in order
+    RemoteCSeq = ersip_sipmsg:get(cseq, RequestSipMsg),
+    RemoteCSeqNum = ersip_hdr_cseq:number(RemoteCSeq),
+    case RemoteCSeqNum =< StoredRCSeq of
+        true ->
+            {reply, ersip_sipmsg:reply(500, RequestSipMsg)};
+        false ->
+            %% Note that RFC 3261 has clause:
+            %%
+            %% Requests sent within a dialog, as any other requests,
+            %% are atomic.  If a particular request is accepted by the
+            %% UAS, all the state changes associated with it are
+            %% performed.  If the request is rejected, none of the
+            %% state changes are performed.
+            %%
+            %% So to be fully conformant we need to update remote_seq
+            %% iff response on request is 2xx. But I've checked all
+            %% major implementations (pjsip, sofia sip, exosip). All
+            %% of them update remote_seq after the check and do not
+            %% care about response.
+            Dialog1 = Dialog0#dialog{remote_seq = RemoteCSeqNum},
+            uas_maybe_update_target(RequestSipMsg, ReqType, Dialog1)
+    end.
 
+-spec remote_seq(dialog()) -> ersip_hdr_cseq:cseq_num() | empty.
+remote_seq(#dialog{remote_seq = RCSeq}) ->
+    RCSeq.
+
+-spec is_secure(dialog()) -> boolean().
+is_secure(#dialog{secure = Secure}) ->
+    Secure.
 
 %%%===================================================================
 %%% Internal Implementation
@@ -226,12 +353,13 @@ uas_create(Request, Response) ->
     ReqTo        = ersip_sipmsg:get(to,      Request),
     [ReqContact] = ersip_sipmsg:get(contact, Request),
     RespTo       = ersip_sipmsg:get(to,      Response),
+    State        = state_by_response(Response),
 
     #dialog{secure     = IsSecure,
             route_set  = RouteSet,
             %% The remote target MUST be set to the URI
             %% from the Contact header field of the request.
-            remote_target = ReqContact,
+            remote_target = ersip_hdr_contact:uri(ReqContact),
             %% The local sequence number MUST be empty.
             local_seq  = empty,
             %% The remote sequence number MUST be set to the value of the
@@ -253,7 +381,7 @@ uas_create(Request, Response) ->
             %% local URI MUST be set to the URI in the To field
             local_uri  = ersip_hdr_fromto:uri(ReqTo),
             %%
-            state = state_by_response(Response)
+            state = State
            }.
 
 -spec uac_create(ersip_request:request(), ersip_sipmsg:sipmsg()) -> dialog().
@@ -289,7 +417,7 @@ uac_create(Request, Response) ->
             route_set = RouteSet,
             %% The remote target MUST be set to the URI from the
             %% Contact header field of the response.
-            remote_target = RespContact,
+            remote_target = ersip_hdr_contact:uri(RespContact),
             %% The local sequence number MUST be set to the value of the sequence
             %% number in the CSeq header field of the request.
             local_seq    = ersip_hdr_cseq:number(ReqCseq),
@@ -368,7 +496,7 @@ check_contact(SipMsg) ->
         {ok, [_]} ->
             ok;
         {ok, List} when is_list(List) ->
-            {error, muliple_contact_forbidden};
+            {error, multiple_contact_forbidden};
         {ok, star} ->
             {error, invalid_star_contact};
         not_found ->
@@ -379,6 +507,10 @@ check_contact(SipMsg) ->
 
 -spec cc_check_record_route(ersip_sipmsg:sipmsg(), ersip_sipmsg:sipmsg()) -> cc_check_result().
 cc_check_record_route(Request, _) ->
+    check_record_route(Request).
+
+-spec check_record_route(ersip_sipmsg:sipmsg()) -> ok | {error, {bad_record_route, term()}}.
+check_record_route(Request) ->
     case ersip_sipmsg:find(record_route, Request) of
         {ok, _} ->
             ok;
@@ -403,7 +535,7 @@ cc_check_uas_sips(Request, Response) ->
         case ersip_sipmsg:find(record_route, Request) of
             not_found ->
                 %% Note: contact is checked before.
-                {ok, [Contact]} = ersip_sipmsg:get(contact, Request),
+                [Contact] = ersip_sipmsg:get(contact, Request),
                 ersip_uri:scheme(ersip_hdr_contact:uri(Contact)) == {scheme, sips};
             {ok, RRSet} ->
                 TopRR = ersip_route_set:first(RRSet),
@@ -412,7 +544,7 @@ cc_check_uas_sips(Request, Response) ->
     case SIPSRURI orelse SIPSNextHop of
         true ->
             %% Note: contact is checked before.
-            {ok, [RespContact]} = ersip_sipmsg:get(contact, Response),
+            [RespContact] = ersip_sipmsg:get(contact, Response),
             case ersip_uri:scheme(ersip_hdr_contact:uri(RespContact)) of
                 {scheme, sips} ->
                     ok;
@@ -452,7 +584,7 @@ cc_check_uac_sips(Request, _Response) ->
     %% Note: contact is checked before.
     case SIPSRURI orelse SIPSRoute of
         true ->
-            {ok, [ReqContact]} = ersip_sipmsg:get(contact, Request),
+            [ReqContact] = ersip_sipmsg:get(contact, Request),
             case ersip_uri:scheme(ersip_hdr_contact:uri(ReqContact)) of
                 {scheme, sips} ->
                     ok;
@@ -500,7 +632,7 @@ fill_request_route(RemoteTarget, RouteSet, ReqSipMsg) ->
             ersip_sipmsg:set_ruri(RemoteTarget, ReqSipMsg);
         false ->
             FirstRoute = ersip_route_set:first(RouteSet),
-            case ersip_route:is_loose_route(FirstRoute) of
+            case ersip_hdr_route:is_loose_route(FirstRoute) of
                 true ->
                     fill_request_loose_route(RemoteTarget, RouteSet, ReqSipMsg);
                 false ->
@@ -526,7 +658,7 @@ fill_request_strict_route(RemoteTarget, RouteSet0, Req0) ->
     %% the UAC MUST place the first URI from the route set into the
     %% Request-URI, stripping any parameters that are not allowed in a
     %% Request-URI.
-    CleanURI = ersip_uri:clear_not_allowed_parts(ruri, ersip_route:uri(FirstRoute)),
+    CleanURI = ersip_uri:clear_not_allowed_parts(ruri, ersip_hdr_route:uri(FirstRoute)),
     Req1 = ersip_sipmsg:set_ruri(CleanURI, Req0),
     %% The UAC MUST add a Route header field containing the remainder
     %% of the route set values in order, including all parameters.  The
@@ -536,3 +668,74 @@ fill_request_strict_route(RemoteTarget, RouteSet0, Req0) ->
     RURIRoute = ersip_hdr_route:make_route(RemoteTarget),
     RouteSet = ersip_route_set:add_last(RURIRoute, RouteSet1),
     ersip_sipmsg:set(route, RouteSet, Req1).
+
+-spec uas_maybe_update_target(ersip_sipmsg:sipmsg(), request_type(), dialog()) -> uas_process_result().
+uas_maybe_update_target(_, regular, #dialog{} = Dialog) ->
+    {ok, Dialog};
+uas_maybe_update_target(ReqSipMsg, target_refresh, #dialog{} = Dialog) ->
+    %% When a UAS receives a target refresh request, it MUST replace the
+    %% dialog's remote target URI with the URI from the Contact header field
+    %% in that request, if present.
+    case ersip_sipmsg:find(contact, ReqSipMsg) of
+        not_found ->
+            {ok, Dialog};
+        {ok, [Contact]} ->
+            ContactURI = ersip_hdr_contact:uri(Contact),
+            case ersip_uri:scheme(ContactURI) of
+                {scheme, S} when S == sip orelse S == sips ->
+                    {ok, Dialog#dialog{remote_target = ContactURI}};
+                _ ->
+                    Reply = ersip_reply:new(400, [{reason, <<"Invalid Contact URI scheme">>}]),
+                    {reply, ersip_sipmsg:reply(Reply, ReqSipMsg)}
+            end;
+        _ ->
+            %% star case and many contacs/
+            Reply = ersip_reply:new(400, [{reason, <<"Invalid Contact">>}]),
+            {reply, ersip_sipmsg:reply(Reply, ReqSipMsg)}
+    end.
+
+%% Normative:
+%% 12.2.1.1 Generating the Request
+%% Requests within a dialog MUST contain strictly monotonically
+%% increasing and contiguous CSeq sequence numbers (increasing-by-one)
+%% in each direction (excepting ACK and CANCEL of course, whose
+%% numbers equal the requests being acknowledged or cancelled).
+%% Therefore, if the local sequence number is not empty, the value of
+%% the local sequence number MUST be incremented by one, and this
+%% value MUST be placed into the CSeq header field.  If the local
+%% sequence number is empty, an initial value MUST be chosen using the
+%% guidelines of Section 8.1.1.5.  The method field in the CSeq header
+%% field value MUST match the method of the request.
+%%
+%% Implementation: we do not touch ACK and CANCEL sequence number if
+%% they are in order.
+-spec maybe_update_cseq(ersip_sipmsg:sipmsg(), dialog(), ersip_sipmsg:sipmsg()) -> ersip_sipmsg:sipmsg().
+maybe_update_cseq(InReq, #dialog{local_seq = empty}, Req) ->
+    CSeq = get_or_create(cseq, InReq),
+    ersip_sipmsg:set(cseq, CSeq, Req);
+maybe_update_cseq(InReq, #dialog{local_seq = LocalSeq}, Req) ->
+    ACK = ersip_method:ack(),
+    CANCEL = ersip_method:cancel(),
+    case ersip_sipmsg:method(InReq) of
+        Method when Method == ACK orelse Method == CANCEL ->
+            case ersip_sipmsg:find(cseq, InReq) of
+                {ok, CSeq} ->
+                    ersip_sipmsg:set(cseq, CSeq, Req);
+                not_found ->
+                    set_cseq(InReq, LocalSeq-1, Req)
+            end;
+        _ ->
+            set_cseq(InReq, LocalSeq, Req)
+    end.
+
+-spec set_cseq(ersip_sipmsg:sipmsg(), pos_integer(), ersip_sipmsg:sipmsg()) -> ersip_sipmsg:sipmsg().
+set_cseq(InReq, LocalSeq, Req) ->
+    CSeq0  = get_or_create(cseq, InReq),
+    CSeqNum = ersip_hdr_cseq:number(CSeq0),
+    CSeq = case LocalSeq >= CSeqNum of
+               true ->
+                   ersip_hdr_cseq:set_number(LocalSeq+1, CSeq0);
+               _ ->
+                   CSeq0
+           end,
+    ersip_sipmsg:set(cseq, CSeq, Req).

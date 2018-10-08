@@ -25,6 +25,7 @@
          get/2,
          set/3,
          copy/3,
+         remove/2,
 
          %% Body manipulation:
          has_body/1,
@@ -32,6 +33,7 @@
          %% Underlying message manipulation:
          raw_message/1,
          raw_header/2,
+         set_raw_header/2,
 
          %% Parse and build message
          parse/2,
@@ -170,6 +172,10 @@ set(HdrAtom, Value, #sipmsg{} = Msg) ->
 copy(HdrAtom, #sipmsg{} = SrcMsg, #sipmsg{} = DstMsg) ->
     ersip_siphdr:copy_headers([HdrAtom], SrcMsg, DstMsg).
 
+-spec remove(known_header(), sipmsg()) -> sipmsg().
+remove(HdrAtom, SipMsg) ->
+    ersip_siphdr:remove_header(HdrAtom, SipMsg).
+
 -spec has_body(ersip_sipmsg:sipmsg()) -> boolean().
 has_body(#sipmsg{} = Msg) ->
     not ersip_iolist:is_empty(ersip_msg:get(body, raw_message(Msg))).
@@ -182,9 +188,13 @@ raw_message(#sipmsg{raw = R}) ->
 raw_header(HdrName, #sipmsg{} = Msg) when is_binary(HdrName) ->
     ersip_msg:get(HdrName, raw_message(Msg)).
 
+-spec set_raw_header(ersip_hdr:header(), sipmsg()) -> sipmsg().
+set_raw_header(RawHdr, #sipmsg{} = SipMsg) ->
+    ersip_siphdr:set_raw_header(RawHdr, SipMsg).
+
 %% @doc Parse Raw message and transform it to SIP message or parse
 %% additional headers of SIP message.
--spec parse(ersip_msg:message() | sipmsg(), [known_header()] | all) -> Result when
+-spec parse(ersip_msg:message() | sipmsg() | binary() | iolist(), [known_header()] | all) -> Result when
       Result :: {ok, sipmsg()}
               | {error, term()}.
 parse(#sipmsg{} = SipMsg, all) ->
@@ -197,6 +207,16 @@ parse(#sipmsg{} = SipMsg, Headers) ->
     HeadersToParse = Headers -- AlreadyParsed,
     MaybeMsg = {ok, SipMsg},
     lists:foldl(fun maybe_parse_header/2, MaybeMsg, HeadersToParse);
+parse(SipMsgBin, What) when is_binary(SipMsgBin) ->
+    P  = ersip_parser:new_dgram(SipMsgBin),
+    case ersip_parser:parse(P) of
+        {{ok, PMsg}, _P2} ->
+            parse(PMsg, What);
+        {{error, Reason}, _} ->
+            {error, {generic_parse_error, Reason}};
+        {more_data, _} ->
+            {error, truncated_message}
+    end;
 parse(RawMsg, all) ->
     parse(RawMsg, ersip_siphdr:all_known_headers());
 parse(RawMsg, Headers) ->
@@ -214,6 +234,7 @@ parse(RawMsg, Headers) ->
                 end,
                 MaybeMsg1,
                 [{fun parse_validate_cseq/1, invalid_cseq}]).
+
 
 -spec serialize(sipmsg()) -> iolist().
 serialize(#sipmsg{} = SipMsg) ->
@@ -359,7 +380,7 @@ method_from_raw(RawMsg) ->
 ruri_from_raw(Msg) ->
     case ersip_msg:get(type, Msg) of
         request ->
-            URIBin = ersip_msg:get(ruri, Msg),
+            URIBin = iolist_to_binary(ersip_msg:get(ruri, Msg)),
             case ersip_uri:parse(URIBin) of
                 {ok, _} = R ->
                     R;
